@@ -8,11 +8,25 @@
 -- 受け取ったシャウト (/shout) とエール (/yell) を覚えておき、コマンドで開く窓に一覧で出す。
 -- 英語だけの発言 (ひらがな・カタカナ・漢字を 1 文字も含まないもの) は覚えない。
 -- Guildwork プラグインの「/gw shouts」(サーバー全体の発言) の出力からも、英語だけの発言を消す。
--- ゲームのサーバーへ送る操作 (発言・魔法・アイテムなど) や、コマンドを自動で打つことは一切しない。
+-- ゲームのサーバーへ送る操作 (発言・魔法・アイテムなど) は一切しない。
+--
+-- 【隠しコマンド: 見張り】 (README と //shl help には載せていない。ここを読んだ人だけが使える)
+--   //shl watch          : 見張りの ON / OFF (初期値は OFF)。一定の間隔で「/gw shouts」を自動で打ち、
+--                          前回から増えた発言だけを「[遠くのシャウト] 名前: 本文」でチャットログに知らせる
+--   //shl watch <秒>     : 見張りの間隔 (60〜600、初期値 120)
+--   //shl watch sound    : 新しい発言の音の ON / OFF (sounds/notify.wav を自分で置いたときだけ鳴る)
+--   //shl mode <番号>    : 知らせに付けるチャットの種類 (色と、ゲームのどのログウィンドウに出るかが変わる。初期値 207)
+--   //shl modetest       : 種類ごとの見本を出す (どのログウィンドウに出るかを調べる)
+--   ・一覧そのものは表示しない。始めた直後の 1 回は、今ある発言を覚えるだけ
+--   ・直接届いた発言 (今いるエリアのシャウト・届いたエール) は、見張りでは重ねて知らせない
+--   ・自動で打つのは Guildwork プラグインが受け取る「/gw shouts」だけ。応答が 3 回続けて無ければ自分で止まる
+--   ・見張りのたびに Guildwork のサーバーへ問い合わせが行く。間隔を必要以上に短くしないこと
+--     (載せていないのは、気軽に大勢が使うとサーバーの負担になるため)
 --
 -- 【動き】
 --   - 受け取り : chat message イベント (シャウト = 1 / エール = 26)。定型文は日本語に直してから判定する
 --   - 表示     : 窓を開いている間、内容が変わったときだけ書き直す
+--   - 見張り   : prerender で時刻を比べるだけ。間隔が来たときに「/gw shouts」を 1 回打つ
 --   - 記録     : メモリの中だけ (最大 MAX_ENTRIES 件)。ファイルには書かない。エリアを変えても消さない
 --
 -- 【文字コード】
@@ -43,6 +57,10 @@ defaults.japanese_only = true  -- 英語だけの発言を覚えない
 defaults.gw_filter = true      -- Guildwork の「/gw shouts」の出力から、英語だけの発言を消す (japanese_only がオンのとき)
 defaults.allow_names = ""         -- 英語だけでも消さない人の名前 (カンマ区切り。大文字小文字は区別しない。//shl allow name で足す)
 defaults.allow_words = ""         -- 英語だけでも消さない言葉 (カンマ区切り。本文に含まれていれば消さない。//shl allow word で足す)
+defaults.watch = false         -- 見張り: 一定の間隔で「/gw shouts」を打ち、新しい発言を知らせる
+defaults.watch_interval = 120  -- 見張りの間隔 (秒。60〜600。Guildwork のサーバーへ問い合わせるので、短くしすぎない)
+defaults.notify_mode = 207     -- 見張りの知らせを出すチャットの種類 (色と、ゲームのどのログウィンドウに出るかが決まる)
+defaults.watch_sound = true    -- 新しい発言があったとき sounds/notify.wav を鳴らす (ファイルがあるときだけ)
 defaults.gw_takeover = false   -- 「/gw shouts」でもこの窓を開く (Guildwork プラグインを外しているとき用)
 
 local settings = config.load(defaults)
@@ -51,8 +69,9 @@ local settings = config.load(defaults)
 -- 定数
 -- -----------------------------------------------------------------------------
 local MODE_SHOUT, MODE_YELL = 1, 26
-local MODE_LABEL = {[MODE_SHOUT] = "シャウト", [MODE_YELL] = "エール"}
-local MODE_COLOR = {[MODE_SHOUT] = {255, 170, 110}, [MODE_YELL] = {255, 235, 120}}
+local MODE_GW = "gw"              -- Guildwork 経由で知った発言 (シャウトとエールの区別は付かない)
+local MODE_LABEL = {[MODE_SHOUT] = "シャウト", [MODE_YELL] = "エール", [MODE_GW] = "遠く"}
+local MODE_COLOR = {[MODE_SHOUT] = {255, 170, 110}, [MODE_YELL] = {255, 235, 120}, [MODE_GW] = {150, 220, 255}}
 local MAX_ENTRIES = 200           -- 覚えておく発言の数 (古いものから捨てる)
 local REPEAT_SEC = 600            -- 同じ人の同じ発言がこの秒数以内にまた来たら、行を増やさず時刻だけ新しくする
 local MOUSE_WHEEL = 10
@@ -212,6 +231,57 @@ end
 -- -----------------------------------------------------------------------------
 -- 受け取り
 -- -----------------------------------------------------------------------------
+-- 直接届いたシャウト・エールの覚え書き。同じ発言は、あとから見張り (Guildwork 経由) でも届くので、
+-- そちらでは知らせないようにするために使う (絞り込みで窓に出さなかった発言も覚える)
+local DIRECT_KEEP_SEC = 900       -- 覚えておく秒数 (見張りの間隔は最長 600 秒)
+local direct_heard = {}           -- 古い順。{at = os.clock(), sender = 名前 (小文字), key = 空白を除いた本文}
+
+-- 比べるための形: 半角・全角の空白を除き、英字は小文字にする
+-- (Guildwork 経由の本文は、空白の入り方が直接届いた本文と少し違う)
+local function squash(text)
+    return (tostring(text or ""):gsub("%s+", ""):gsub("　", ""):lower())
+end
+
+local function remember_direct(sender, text)
+    local now = os.clock()
+    while direct_heard[1] and now - direct_heard[1].at > DIRECT_KEEP_SEC do table.remove(direct_heard, 1) end
+    direct_heard[#direct_heard + 1] = {at = now, sender = tostring(sender or ""):lower(), key = squash(text)}
+end
+
+-- 見張りで届いた発言 (名前と、clean_gw_body を通した本文) が、すでに直接届いたものか。
+-- 定型文は、直接届いた分は日本語、Guildwork 経由は英語を {…} で囲んだ形になるので、
+-- {…} の外側の文字だけを順番に探して比べる (外側に 4 バイト以上の文字があるときだけ)
+local function heard_directly(name, body)
+    local now = os.clock()
+    local sender = tostring(name or ""):lower()
+    local key = squash(body)
+    local parts, literal = {}, 0
+    for part in (body .. "{}"):gmatch("(.-)%b{}") do
+        part = squash(part)
+        if part ~= "" then
+            parts[#parts + 1] = part
+            literal = literal + #part
+        end
+    end
+    for i = #direct_heard, 1, -1 do
+        local d = direct_heard[i]
+        if now - d.at > DIRECT_KEEP_SEC then break end
+        if d.sender == sender then
+            if d.key == key then return true end
+            if #parts > 0 and literal >= 4 and body:find("{", 1, true) then
+                local pos, all = 1, true
+                for _, part in ipairs(parts) do
+                    local from, to = d.key:find(part, pos, true)
+                    if not from then all = false; break end
+                    pos = to + 1
+                end
+                if all then return true end
+            end
+        end
+    end
+    return false
+end
+
 local function add_entry(mode, sender, text)
     local now = os.time()
     -- 同じ人が同じ発言を繰り返しているときは、行を増やさずいちばん下へ移す
@@ -238,6 +308,7 @@ local function on_chat(message, sender, mode)
     if mode ~= MODE_SHOUT and mode ~= MODE_YELL then return end
     local text = to_display(message)
     if text == "" then return end
+    remember_direct(sender, text)
     if settings.japanese_only and not is_wanted(sender, text) then return end
     add_entry(mode, tostring(sender or "?"), text)
 end
@@ -273,16 +344,31 @@ end)
 -- -----------------------------------------------------------------------------
 -- Guildwork プラグインの「/gw shouts」
 --   プラグインは、サーバー全体のシャウト・エールを「名前[???]: 本文」の形 (種類 3) で、古い順にチャットログへ出す。
---   「/gw shouts」を打ってから GW_WINDOW_SEC 秒の間に届いたその形の行のうち、英語だけの発言を消す。
---   その形でない行には触らない
+--   (1) 自分で打ったとき: 打ってから GW_WINDOW_SEC 秒の間に届いたその形の行のうち、英語だけの発言を消す
+--   (2) 見張り          : 一定の間隔でこのアドオンが打ち、届いた行は全部隠して、前回から増えた発言だけを知らせる
+--   どちらも、その形でない行には触らない
 -- -----------------------------------------------------------------------------
 local GW_WINDOW_SEC = 8           -- 自分で打ったあと、出力が届くのを待つ秒数
+local GW_POLL_WAIT_SEC = 4        -- 見張りで打ったあと、出力が届くのを待つ秒数
 local GW_MODE = 3                 -- プラグインが出す行の種類
+local GW_MAX_MISSES = 3           -- 見張りで、この回数続けて応答が無ければ止める (プラグインが無い・ログインしていない)
+local WATCH_MIN_SEC, WATCH_MAX_SEC = 60, 600
+local NOTIFY_SOUND = windower.addon_path .. "sounds/notify.wav"
 
 local gw = {
     until_at = 0,      -- この時刻まで、届いた行を調べる (0 = 調べていない)
+    poll = false,      -- 今調べているのは見張りで打った分か
+    sent_at = -100,    -- 見張りで打った時刻
+    next_poll = 0,     -- 次に見張りで打つ時刻
+    batch = {},        -- 見張りで今回届いた行 {name, body}
+    last = nil,        -- 前回の見張りで届いた行の並び (比べるための文字列の一覧)
+    misses = 0,        -- 続けて応答が無かった回数
     shown = 0, hidden = 0,
 }
+
+local function watch_interval()
+    return math.max(WATCH_MIN_SEC, math.min(WATCH_MAX_SEC, tonumber(settings.watch_interval) or 120))
+end
 
 -- 「名前[???]: 本文」の行を名前と本文 (UTF-8) に分ける。その形でなければ nil
 local function parse_gw_line(original)
@@ -295,11 +381,83 @@ local function parse_gw_line(original)
     return name, body
 end
 
+-- 知らせるときの本文: 定型文の印 [at]…[/at] を {…} に、&#34; のような書き方を元の文字に直す
+local function clean_gw_body(body)
+    body = body:gsub("%[at%]", "{"):gsub("%[/at%]", "}")
+    body = body:gsub("&#(%d+);", function(n)
+        n = tonumber(n)
+        return (n and n >= 32 and n < 127) and string.char(n) or ""
+    end)
+    body = body:gsub("[%z\1-\31\127]", " "):gsub("\\", "＼"):gsub("%${", "$ {")
+    return body
+end
+
+local function stop_watch(reason)
+    settings.watch = false
+    gw.last, gw.misses = nil, 0
+    config.save(settings)
+    if reason then chat_msg("[ShoutLog] " .. reason, 167) end
+end
+
+-- 見張りで届いた行を前回と比べ、増えた発言だけを知らせる
+local function process_batch()
+    local batch = gw.batch
+    gw.batch = {}
+    if #batch == 0 then
+        gw.misses = gw.misses + 1
+        if gw.misses >= GW_MAX_MISSES then
+            stop_watch("Guildwork から応答が無いので、見張りを止めました。//load Guildwork と Guildwork へのログインを確かめてから //shl watch で始め直してください。")
+        end
+        return
+    end
+    gw.misses = 0
+    local keys = {}
+    for i, e in ipairs(batch) do keys[i] = e.name .. "\0" .. e.body end
+    local old = gw.last
+    gw.last = keys
+    if not old then return end   -- 最初の 1 回は、今ある発言を覚えるだけ
+
+    -- 行は古い順に届く。前回の後ろ側と今回の前側が重なるところを探し、その先を新しい発言とする
+    local new_from = 1
+    for j = 1, #old do
+        local len = #old - j + 1
+        if len <= #keys then
+            local same = true
+            for k = 1, len do
+                if old[j + k - 1] ~= keys[k] then same = false; break end
+            end
+            if same then new_from = len + 1; break end
+        end
+    end
+
+    local told = 0
+    for i = new_from, #keys do
+        local e = batch[i]
+        local body = clean_gw_body(e.body)
+        -- 直接届いた発言 (自分のいるエリアのシャウト・届いたエール) は、もう見えているので知らせない
+        if heard_directly(e.name, body) then
+            gw.skipped_direct = (gw.skipped_direct or 0) + 1
+        elseif not settings.japanese_only or is_wanted(e.name, e.body) then
+            chat_msg(string.format("[遠くのシャウト] %s: %s", e.name, body), tonumber(settings.notify_mode) or 207)
+            add_entry(MODE_GW, e.name, body)
+            told = told + 1
+        end
+    end
+    if told > 0 and settings.watch_sound and windower.file_exists and windower.file_exists(NOTIFY_SOUND) then
+        windower.play_sound(NOTIFY_SOUND)
+    end
+end
+
 windower.register_event("incoming text", function(original, modified, original_mode)
     if gw.until_at == 0 or original_mode ~= GW_MODE then return end
     if os.clock() > gw.until_at then return end
     local ok, name, body = pcall(parse_gw_line, original)
     if not ok or not name then return end
+    if gw.poll then
+        -- 見張りで打った分: 全部隠して、あとでまとめて比べる
+        gw.batch[#gw.batch + 1] = {name = name, body = body}
+        return true
+    end
     if not (settings.gw_filter and settings.japanese_only) then return end
     if not is_wanted(name, body) then
         gw.hidden = gw.hidden + 1
@@ -308,11 +466,35 @@ windower.register_event("incoming text", function(original, modified, original_m
     gw.shown = gw.shown + 1
 end)
 
+-- 見張り: 待ち時間が過ぎた出力を片づけ、間隔が来たら「/gw shouts」を打つ。普段は時刻を比べるだけ
+local function watch_tick(now)
+    if gw.until_at ~= 0 and now > gw.until_at then
+        local was_poll = gw.poll
+        gw.until_at, gw.poll = 0, false
+        if was_poll then process_batch() end
+    end
+    if not settings.watch or gw.until_at ~= 0 or now < gw.next_poll then return end
+    gw.next_poll = now + watch_interval()
+    local info = windower.ffxi.get_info()
+    if not (info and info.logged_in) then return end
+    gw.batch = {}
+    gw.poll, gw.sent_at, gw.until_at = true, now, now + GW_POLL_WAIT_SEC
+    windower.send_command("input /gw shouts")
+end
+
+windower.register_event("prerender", function()
+    if not settings.watch and gw.until_at == 0 then return end
+    local ok, err = pcall(watch_tick, os.clock())
+    if not ok then report_error("見張りエラー", err) end
+end)
+
 -- 「/gw shouts」が打たれたとき: 自分で打った分なら上の絞り込みを始める。
 -- 設定 gw_takeover がオンなら、代わりにこの窓を開く (発言はゲームに送らない)
 windower.register_event("outgoing text", function(original)
     local is_shouts = tostring(original or ""):lower():find("^/gw%s+shout") ~= nil
+    if is_shouts and os.clock() - gw.sent_at < 1.0 then return end   -- 見張りで打った分
     if is_shouts then
+        gw.poll, gw.batch = false, {}
         gw.until_at = os.clock() + GW_WINDOW_SEC
         gw.shown, gw.hidden = 0, 0
     end
@@ -332,7 +514,8 @@ end)
 windower.register_event("logout", function()
     entries = {}
     offset = 0
-    gw.until_at = 0
+    gw.until_at, gw.poll, gw.batch, gw.last, gw.misses = 0, false, {}, nil, 0
+    direct_heard = {}
     if visible then set_visible(false) end
 end)
 windower.register_event("unload", function()
@@ -386,6 +569,21 @@ windower.register_event("addon command", function(cmd, ...)
         chat_msg(string.format("[ShoutLog] 英語だけの発言: %s (これから受け取る分に効きます)",
             settings.japanese_only and "覚えない" or "覚える"))
 
+    elseif cmd == "mode" and tonumber(args[1]) then
+        -- 見張りの知らせを出すチャットの種類。どのログウィンドウに出るかは、ゲームのログの設定しだい
+        settings.notify_mode = math.max(0, math.min(255, math.floor(tonumber(args[1]))))
+        config.save(settings)
+        chat_msg(string.format("[遠くのシャウト] 知らせの種類を %d にしました (この行がその見本です)。", settings.notify_mode), settings.notify_mode)
+
+    elseif cmd == "modetest" then
+        -- 種類ごとに 1 行ずつ出す。どの行がどのログウィンドウに出たかを見て、//shl mode <番号> で選ぶ
+        local modes = {}
+        for i = 1, #args do modes[#modes + 1] = tonumber(args[i]) end
+        if #modes == 0 then modes = {207, 10, 11, 127, 121, 200, 8, 1} end
+        for _, mode in ipairs(modes) do
+            chat_msg(string.format("[ShoutLog] 種類 %d の見本", mode), mode)
+        end
+
     elseif cmd == "allow" then
         -- //shl allow : 例外の一覧 / //shl allow name <名前> ・ //shl allow word <言葉> : 足す (もう一度打つと外す)
         local kind = args[1] and args[1]:lower()
@@ -417,6 +615,32 @@ windower.register_event("addon command", function(cmd, ...)
     elseif cmd == "status" then
         chat_msg(string.format("[ShoutLog] 英語だけの発言を消す: 窓 %s / 「/gw shouts」の出力 %s (前回: 表示 %d 行・消した %d 行)",
             settings.japanese_only and "ON" or "OFF", (settings.gw_filter and settings.japanese_only) and "ON" or "OFF", gw.shown, gw.hidden))
+        if settings.watch then   -- 隠しコマンドなので、使っている人にだけ見せる
+            chat_msg(string.format("[ShoutLog] 見張り: ON / 間隔 %d 秒 / 音 %s / 直接届いていたので知らせなかった発言 %d 件",
+                watch_interval(), settings.watch_sound and "ON" or "OFF", gw.skipped_direct or 0))
+        end
+
+    elseif cmd == "watch" then
+        -- //shl watch : 見張りの ON/OFF / //shl watch <秒> : 間隔 / //shl watch sound : 音の ON/OFF
+        local sub = args[1] and args[1]:lower()
+        if tonumber(sub) then
+            settings.watch_interval = math.max(WATCH_MIN_SEC, math.min(WATCH_MAX_SEC, math.floor(tonumber(sub))))
+            config.save(settings)
+            chat_msg(string.format("[ShoutLog] 見張りの間隔を %d 秒にしました。", settings.watch_interval))
+        elseif sub == "sound" then
+            settings.watch_sound = not settings.watch_sound
+            config.save(settings)
+            chat_msg(string.format("[ShoutLog] 新しい発言の音: %s%s", settings.watch_sound and "ON" or "OFF",
+                (windower.file_exists and not windower.file_exists(NOTIFY_SOUND)) and " (sounds/notify.wav がありません)" or ""))
+        elseif settings.watch then
+            stop_watch()
+            chat_msg("[ShoutLog] 見張り: OFF")
+        else
+            settings.watch = true
+            gw.last, gw.misses, gw.next_poll = nil, 0, os.clock() + 2
+            config.save(settings)
+            chat_msg(string.format("[ShoutLog] 見張り: ON (%d 秒ごとに Guildwork の発言を調べ、新しいものだけ知らせます)", watch_interval()))
+        end
 
     elseif cmd == "gw" then
         settings.gw_takeover = not settings.gw_takeover
@@ -424,6 +648,7 @@ windower.register_event("addon command", function(cmd, ...)
         chat_msg(string.format("[ShoutLog] 「/gw shouts」でこの窓を開く: %s", settings.gw_takeover and "ON" or "OFF"))
 
     else
+        -- 見張りのコマンド (watch・mode・modetest) は隠しコマンドなので、ここには出さない (冒頭のコメントを参照)
         chat_msg("=== ShoutLog コマンドヘルプ ===")
         chat_msg("//shl              : 窓を開く / 閉じる")
         chat_msg("//shl clear        : 記録を消す")
