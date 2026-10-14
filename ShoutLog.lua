@@ -1,5 +1,5 @@
 -- =============================================================================
--- ShoutLog.lua : シャウトとエールを覚えておき、あとから小さな窓で読み返すアドオン (v1.5.0)
+-- ShoutLog.lua : シャウトとエールを覚えておき、あとから小さな窓で読み返すアドオン (v1.5.1)
 -- =============================================================================
 -- 【目的】
 -- ソロで遊んでいる間に、参加したかった募集のシャウト・エールを見逃さないようにする。
@@ -36,7 +36,7 @@
 
 _addon.name     = "ShoutLog"
 _addon.author   = "hikaruoshino"
-_addon.version  = "1.5.0"
+_addon.version  = "1.5.1"
 _addon.commands = {"shoutlog", "shl"}
 
 require("luau")
@@ -351,6 +351,7 @@ end)
 local GW_WINDOW_SEC = 8           -- 自分で打ったあと、出力が届くのを待つ秒数
 local GW_POLL_WAIT_SEC = 4        -- 見張りで打ったあと、出力が届くのを待つ秒数
 local GW_MODE = 3                 -- プラグインが出す行の種類
+local GW_MODE_ALT = 2             -- 2026-10-15 以降の版は、一部の行 (長い発言の続きなど) を種類 2 で出す。"[???]" の行だけ対象にする
 local GW_MAX_MISSES = 3           -- 見張りで、この回数続けて応答が無ければ止める (プラグインが無い・ログインしていない)
 local WATCH_MIN_SEC, WATCH_MAX_SEC = 60, 600
 local NOTIFY_SOUND = windower.addon_path .. "sounds/notify.wav"
@@ -449,7 +450,10 @@ local function process_batch()
 end
 
 windower.register_event("incoming text", function(original, modified, original_mode)
-    if gw.until_at == 0 or original_mode ~= GW_MODE then return end
+    if gw.until_at == 0 then return end
+    if original_mode ~= GW_MODE and not (original_mode == GW_MODE_ALT and tostring(original or ""):find("^[%a%d_%-']+%[%?%?%?%]: ")) then
+        return
+    end
     if os.clock() > gw.until_at then return end
     local ok, name, body = pcall(parse_gw_line, original)
     if not ok or not name then return end
