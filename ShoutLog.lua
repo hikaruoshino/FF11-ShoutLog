@@ -1,5 +1,5 @@
 -- =============================================================================
--- ShoutLog.lua : シャウトとエールを覚えておき、あとから小さな窓で読み返すアドオン (v1.6.0)
+-- ShoutLog.lua : シャウトとエールを覚えておき、あとから小さな窓で読み返すアドオン (v1.6.1)
 -- =============================================================================
 -- 【目的】
 -- ソロで遊んでいる間に、参加したかった募集のシャウト・エールを見逃さないようにする。
@@ -37,7 +37,7 @@
 
 _addon.name     = "ShoutLog"
 _addon.author   = "hikaruoshino"
-_addon.version  = "1.6.0"
+_addon.version  = "1.6.1"
 _addon.commands = {"shoutlog", "shl"}
 
 require("luau")
@@ -237,10 +237,10 @@ end
 local DIRECT_KEEP_SEC = 900       -- 覚えておく秒数 (見張りの間隔は最長 600 秒)
 local direct_heard = {}           -- 古い順。{at = os.clock(), sender = 名前 (小文字), key = 空白を除いた本文}
 
--- 比べるための形: 半角・全角の空白を除き、英字は小文字にする
--- (Guildwork 経由の本文は、空白の入り方が直接届いた本文と少し違う)
+-- 比べるための形: 半角・全角の空白と定型文の括弧 { } を除き、英字は小文字にする
+-- (Guildwork 経由の本文は、空白の入り方が直接届いた本文と少し違う。定型文の括弧は片方にしか無いことがある)
 local function squash(text)
-    return (tostring(text or ""):gsub("%s+", ""):gsub("　", ""):lower())
+    return (tostring(text or ""):gsub("[%s{}]+", ""):gsub("　", ""):lower())
 end
 
 local function remember_direct(sender, text)
@@ -476,14 +476,14 @@ local function process_batch()
     local told = 0
     for i = new_from, #keys do
         local e = batch[i]
-        local body = clean_gw_body(e.body)
+        -- 定型文は先に日本語にしてから比べる (定型文だけの発言は、日本語どうしでないと同じと分からない)
+        local body = translate_phrases(clean_gw_body(e.body))
         -- 直接届いた発言 (自分のいるエリアのシャウト・届いたエール) は、もう見えているので知らせない
         if heard_directly(e.name, body) then
             gw.skipped_direct = (gw.skipped_direct or 0) + 1
         elseif not settings.japanese_only or is_wanted(e.name, e.body) then
-            local shown = translate_phrases(body)
-            chat_msg(string.format("[遠くのシャウト] %s: %s", e.name, shown), tonumber(settings.notify_mode) or 207)
-            add_entry(MODE_GW, e.name, shown)
+            chat_msg(string.format("[遠くのシャウト] %s: %s", e.name, body), tonumber(settings.notify_mode) or 207)
+            add_entry(MODE_GW, e.name, body)
             told = told + 1
         end
     end
