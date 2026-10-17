@@ -1,5 +1,5 @@
 -- =============================================================================
--- ShoutLog.lua : シャウトとエールを覚えておき、あとから小さな窓で読み返すアドオン (v1.5.1)
+-- ShoutLog.lua : シャウトとエールを覚えておき、あとから小さな窓で読み返すアドオン (v1.6.0)
 -- =============================================================================
 -- 【目的】
 -- ソロで遊んでいる間に、参加したかった募集のシャウト・エールを見逃さないようにする。
@@ -27,6 +27,7 @@
 --   - 受け取り : chat message イベント (シャウト = 1 / エール = 26)。定型文は日本語に直してから判定する
 --   - 表示     : 窓を開いている間、内容が変わったときだけ書き直す
 --   - 見張り   : prerender で時刻を比べるだけ。間隔が来たときに「/gw shouts」を 1 回打つ
+--              届いた発言の {English} (定型文・アイテム名) は、res の英語名から日本語に直して知らせる
 --   - 記録     : メモリの中だけ (最大 MAX_ENTRIES 件)。ファイルには書かない。エリアを変えても消さない
 --
 -- 【文字コード】
@@ -36,7 +37,7 @@
 
 _addon.name     = "ShoutLog"
 _addon.author   = "hikaruoshino"
-_addon.version  = "1.5.1"
+_addon.version  = "1.6.0"
 _addon.commands = {"shoutlog", "shl"}
 
 require("luau")
@@ -393,6 +394,47 @@ local function clean_gw_body(body)
     return body
 end
 
+-- 見張りで届く定型文は、Guildwork が英語で送ってくる ({Bazaar} など)。{…} の中を日本語に直す。
+-- res の auto_translates.lua → items.lua の順に、1 行ずつ読んで英語名を探す (全部をメモリに載せない)。
+-- 初めての言葉があるときだけ読み、結果は覚える。見つからない言葉は英語のまま残す。
+local PHRASE_FILES = {"res/auto_translates.lua", "res/items.lua"}
+local phrase_ja = {}   -- 小文字の英語 → 日本語 (見つからなかったものは false)
+
+local function lookup_phrases(wanted)
+    local base = windower.windower_path
+    if type(base) == "string" then
+        for _, rel in ipairs(PHRASE_FILES) do
+            local f = io.open(base .. rel, "r")
+            if f then
+                for line in f:lines() do
+                    local en, ja = line:match('{id=%d+,en="(.-)",ja="(.-)"')
+                    if en then
+                        local key = en:lower()
+                        if wanted[key] and not phrase_ja[key] and ja ~= "" then phrase_ja[key] = ja end
+                    end
+                end
+                f:close()
+            end
+        end
+    end
+    for key in pairs(wanted) do
+        if not phrase_ja[key] then phrase_ja[key] = false end
+    end
+end
+
+local function translate_phrases(body)
+    local wanted, missing = {}, false
+    for en in body:gmatch("{([^{}]+)}") do
+        local key = en:lower()
+        if phrase_ja[key] == nil then wanted[key] = true; missing = true end
+    end
+    if missing then lookup_phrases(wanted) end
+    return (body:gsub("{([^{}]+)}", function(en)
+        local ja = phrase_ja[en:lower()]
+        if ja then return "{" .. ja .. "}" end
+    end))
+end
+
 local function stop_watch(reason)
     settings.watch = false
     gw.last, gw.misses = nil, 0
@@ -439,8 +481,9 @@ local function process_batch()
         if heard_directly(e.name, body) then
             gw.skipped_direct = (gw.skipped_direct or 0) + 1
         elseif not settings.japanese_only or is_wanted(e.name, e.body) then
-            chat_msg(string.format("[遠くのシャウト] %s: %s", e.name, body), tonumber(settings.notify_mode) or 207)
-            add_entry(MODE_GW, e.name, body)
+            local shown = translate_phrases(body)
+            chat_msg(string.format("[遠くのシャウト] %s: %s", e.name, shown), tonumber(settings.notify_mode) or 207)
+            add_entry(MODE_GW, e.name, shown)
             told = told + 1
         end
     end
