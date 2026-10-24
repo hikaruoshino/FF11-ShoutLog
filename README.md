@@ -126,3 +126,9 @@ Guildwork を使わない場合でも、「2. あとから読み返す窓」は�
 
 * **v1.5.0 (2026-10-12)**
   * 最初の公開版。
+
+## 不具合・動作報告 / Feedback
+
+「動きました」の一言だけでも歓迎です。GitHub のアカウントがあれば、[Issues](../../issues/new/choose) から書き込めます (日本語・英語どちらでも)。
+
+A one-line "it works" is welcome too. With a GitHub account you can post from [Issues](../../issues/new/choose) (Japanese or English).
